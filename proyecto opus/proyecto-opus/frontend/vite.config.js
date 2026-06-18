@@ -7,7 +7,7 @@ export default defineConfig({
 	plugins: [svelte()],
 	resolve: {
 		alias: {
-			'@': resolve(__cmd, './src')
-		}
+  					'@': resolve(__dirname, './src')  // __cmd → __dirname
+				}
 	}
 })
