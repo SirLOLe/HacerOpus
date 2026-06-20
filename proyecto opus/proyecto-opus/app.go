@@ -17,14 +17,13 @@ type App struct {
 	ctx context.Context
 }
 
-// Actualizamos el struct para recibir los nuevos parámetros de Svelte
 type ConversionSettings struct {
 	Bitrate          string `json:"bitrate"`
 	CoverSize        int    `json:"coverSize"`
 	Quality          int    `json:"quality"`
 	ReplaceCover     bool   `json:"replaceCover"`
-	CompressionLevel int    `json:"compressionLevel"` // 0 a 10
-	Threads          int    `json:"threads"`          // Cantidad dinámica
+	CompressionLevel int    `json:"compressionLevel"`
+	Threads          int    `json:"threads"`
 }
 
 type ProgressUpdate struct {
@@ -41,9 +40,7 @@ type TrackMetadata struct {
 	Title  string
 }
 
-func NewApp() *App {
-	return &App{}
-}
+func NewApp() *App { return &App{} }
 
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
@@ -60,63 +57,94 @@ func (a *App) SelectDirectory(title string) string {
 }
 
 func getMetadata(filePath string) TrackMetadata {
+	fileName := strings.TrimSuffix(filepath.Base(filePath), filepath.Ext(filePath))
+	dirName := filepath.Base(filepath.Dir(filePath))
+
+	meta := TrackMetadata{
+		Artist: "Desconocido",
+		Album:  "Desconocido",
+		Title:  fileName,
+	}
+
 	cmd := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", filePath)
 	output, err := cmd.Output()
-	
-	meta := TrackMetadata{Artist: "Desconocido", Album: "Desconocido", Title: filepath.Base(filePath)}
-	if err != nil {
-		return meta
-	}
-
-	var data struct {
-		Format struct {
-			Tags map[string]string `json:"tags"`
-		} `json:"format"`
-	}
-
-	if err := json.Unmarshal(output, &data); err == nil {
-		for k, v := range data.Format.Tags {
-			lowerK := strings.ToLower(k)
-			if lowerK == "artist" {
-				meta.Artist = v
-			} else if lowerK == "album" {
-				meta.Album = v
-			} else if lowerK == "title" {
-				meta.Title = v
+	if err == nil {
+		var data struct {
+			Format struct {
+				Tags map[string]string `json:"tags"`
+			} `json:"format"`
+		}
+		if json.Unmarshal(output, &data) == nil {
+			for k, v := range data.Format.Tags {
+				switch strings.ToLower(k) {
+				case "artist", "album_artist", "albumartist":
+					if meta.Artist == "Desconocido" {
+						meta.Artist = v
+					}
+				case "album":
+					meta.Album = v
+				case "title":
+					meta.Title = v
+				}
 			}
 		}
 	}
-	
-	replacer := strings.NewReplacer("<", "", ">", "", ":", "", "\"", "", "/", "-", "\\", "-", "|", "", "?", "", "*", "")
-	meta.Artist = strings.TrimSpace(replacer.Replace(meta.Artist))
-	meta.Album = strings.TrimSpace(replacer.Replace(meta.Album))
-	meta.Title = strings.TrimSpace(replacer.Replace(meta.Title))
-	
-	return meta
-}
 
-func findLocalCover(dir string) string {
-	coverNames := []string{"cover.jpg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "front.png"}
-	for _, name := range coverNames {
-		path := filepath.Join(dir, name)
-		if _, err := os.Stat(path); err == nil {
-			return path
+	// Fallback: parsear nombre de archivo si faltan tags
+	if meta.Title == fileName || meta.Title == "" {
+		if parts := strings.SplitN(fileName, " - ", 2); len(parts) == 2 {
+			left := strings.TrimSpace(parts[0])
+			right := strings.TrimSpace(parts[1])
+			isNum := true
+			for _, c := range strings.TrimRight(left, ".") {
+				if c < '0' || c > '9' {
+					isNum = false
+					break
+				}
+			}
+			if isNum {
+				meta.Title = right
+			} else {
+				if meta.Artist == "Desconocido" {
+					meta.Artist = left
+				}
+				meta.Title = right
+			}
 		}
 	}
-	return ""
+
+	// Fallback: usar carpeta como álbum
+	if meta.Album == "Desconocido" && dirName != "." && dirName != "" {
+		meta.Album = dirName
+	}
+
+	// Limpiar caracteres inválidos en Windows
+	r := strings.NewReplacer(
+		"<", "", ">", "", ":", "", "\"", "",
+		"/", "-", "\\", "-", "|", "", "?", "", "*", "",
+	)
+	meta.Artist = strings.TrimSpace(r.Replace(meta.Artist))
+	meta.Album = strings.TrimSpace(r.Replace(meta.Album))
+	meta.Title = strings.TrimSpace(r.Replace(meta.Title))
+
+	if meta.Artist == "" { meta.Artist = "Desconocido" }
+	if meta.Album  == "" { meta.Album  = "Desconocido" }
+	if meta.Title  == "" { meta.Title  = fileName }
+
+	return meta
 }
 
 func (a *App) ConvertLibrary(inputDir string, outputDir string, settings ConversionSettings) string {
 	var audioFiles []string
-	validExts := map[string]bool{".mp3": true, ".flac": true, ".m4a": true, ".wav": true, ".ogg": true, ".opus": true}
+	validExts := map[string]bool{
+		".mp3": true, ".flac": true, ".m4a": true,
+		".wav": true, ".ogg": true, ".opus": true,
+	}
 
 	filepath.Walk(inputDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
+		if err != nil { return nil }
 		if !info.IsDir() {
-			ext := strings.ToLower(filepath.Ext(path))
-			if validExts[ext] {
+			if validExts[strings.ToLower(filepath.Ext(path))] {
 				audioFiles = append(audioFiles, path)
 			}
 		}
@@ -128,18 +156,12 @@ func (a *App) ConvertLibrary(inputDir string, outputDir string, settings Convers
 		return "No se encontraron archivos de audio."
 	}
 
-	var wg sync.WaitGroup
-	
-	// PROTECCIÓN: Si el usuario manda 0 hilos, forzamos a 1
 	threads := settings.Threads
-	if threads < 1 {
-		threads = 1
-	}
-	// Aplicamos el límite de hilos dinámico
+	if threads < 1 { threads = 1 }
+
 	sem := make(chan struct{}, threads)
-	
-	var processed int
-	var errorsCount int
+	var wg sync.WaitGroup
+	var processed, errorsCount int
 	var mu sync.Mutex
 
 	for _, file := range audioFiles {
@@ -148,103 +170,68 @@ func (a *App) ConvertLibrary(inputDir string, outputDir string, settings Convers
 
 		go func(filePath string) {
 			defer wg.Done()
+			defer func() { <-sem }()
 
 			meta := getMetadata(filePath)
-			
+
 			outDirPath := filepath.Join(outputDir, meta.Artist, meta.Album)
 			os.MkdirAll(outDirPath, os.ModePerm)
-			outName := meta.Title + ".opus"
-			outPath := filepath.Join(outDirPath, outName)
+			outPath := filepath.Join(outDirPath, meta.Title+".opus")
 
+			// Saltar si ya existe
 			if _, err := os.Stat(outPath); err == nil {
-    mu.Lock()
-    processed++
-    progress := (float64(processed) / float64(total)) * 100
-    runtime.EventsEmit(a.ctx, "conversion_progress", ProgressUpdate{
-        CurrentFile: filepath.Base(filePath) + " (omitido)",
-        Progress:    progress,
-        Processed:   processed,
-        Total:       total,
-        Errors:      errorsCount,
-    })
-    mu.Unlock()
-    <-sem
-    return
-}
-
-			coverToUse := ""
-			tempDir := filepath.Join(os.TempDir(), "haceropus_temp")
-			os.MkdirAll(tempDir, os.ModePerm)
-			extractedCover := filepath.Join(tempDir, filepath.Base(filePath)+"_cover.jpg")
-
-			extractCmd := exec.Command("ffmpeg", "-y", "-i", filePath, "-an", "-vcodec", "copy", extractedCover)
-			if err := extractCmd.Run(); err == nil {
-				coverToUse = extractedCover
-			} else {
-				coverToUse = findLocalCover(filepath.Dir(filePath))
+				mu.Lock()
+				processed++
+				progress := (float64(processed) / float64(total)) * 100
+				runtime.EventsEmit(a.ctx, "conversion_progress", ProgressUpdate{
+					CurrentFile: filepath.Base(filePath) + " (omitido)",
+					Progress:    progress, Processed: processed,
+					Total: total, Errors: errorsCount,
+				})
+				mu.Unlock()
+				return
 			}
 
-			ffmpegArgs := []string{"-y", "-i", filePath}
-
-			if coverToUse != "" {
-				resizedCover := filepath.Join(tempDir, filepath.Base(filePath)+"_resized.jpg")
-				scaleFilter := fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease,pad=%d:%d:(ow-iw)/2:(oh-ih)/2", 
-					settings.CoverSize, settings.CoverSize, settings.CoverSize, settings.CoverSize)
-				
-				resizeCmd := exec.Command("ffmpeg", "-y", "-i", coverToUse, "-vf", scaleFilter, "-q:v", fmt.Sprintf("%d", settings.Quality), resizedCover)
-				resizeCmd.Run()
-
-				ffmpegArgs = append(ffmpegArgs, "-i", resizedCover, "-map", "0:a", "-map", "1:v")
-			} else {
-				ffmpegArgs = append(ffmpegArgs, "-map", "0:a")
-			}
-
-			// MEJORA: Se añade -compression_level y -ar 48000 para optimización nativa Opus
-			ffmpegArgs = append(ffmpegArgs, 
-				"-threads", "1",
-				"-c:a", "libopus", 
-				"-b:a", settings.Bitrate, 
-				"-vbr", "on", 
-				"-compression_level", fmt.Sprintf("%d", settings.CompressionLevel), 
+			// Comando FFmpeg limpio — solo audio, sin portada
+			// (Opus/Ogg no soporta streams de video incrustados)
+			args := []string{
+				"-y",
+				"-i", filePath,
+				"-vn",   // Ignorar cualquier stream de video/portada del input
+				"-c:a", "libopus",
+				"-b:a", settings.Bitrate,
+				"-vbr", "on",
+				"-compression_level", fmt.Sprintf("%d", settings.CompressionLevel),
 				"-ar", "48000",
-				"-map_metadata", "0")
-			
-			if coverToUse != "" {
-				ffmpegArgs = append(ffmpegArgs, "-c:v", "copy", "-disposition:v", "attached_pic")
+				"-threads", "1",
+				"-map_metadata", "0",
+				outPath,
 			}
-			
-			ffmpegArgs = append(ffmpegArgs, outPath)
 
-			cmd := exec.Command("ffmpeg", ffmpegArgs...)
+			cmd := exec.Command("ffmpeg", args...)
+			var stderr strings.Builder
+			cmd.Stderr = &stderr
+
 			err := cmd.Run()
-
-			os.Remove(extractedCover)
-			if coverToUse != "" {
-				os.Remove(filepath.Join(tempDir, filepath.Base(filePath)+"_resized.jpg"))
-			}
 
 			mu.Lock()
 			processed++
 			if err != nil {
 				errorsCount++
+				// Log del error real para debuggear si vuelve a fallar
+				fmt.Printf("ERROR [%s]: %v\n→ %s\n",
+					filepath.Base(filePath), err, stderr.String())
 			}
-			
 			progress := (float64(processed) / float64(total)) * 100
-			update := ProgressUpdate{
+			runtime.EventsEmit(a.ctx, "conversion_progress", ProgressUpdate{
 				CurrentFile: filepath.Base(filePath),
-				Progress:    progress,
-				Processed:   processed,
-				Total:       total,
-				Errors:      errorsCount,
-			}
-			
-			runtime.EventsEmit(a.ctx, "conversion_progress", update)
+				Progress:    progress, Processed: processed,
+				Total: total, Errors: errorsCount,
+			})
 			mu.Unlock()
-
-			<-sem
 		}(file)
 	}
 
 	wg.Wait()
-	return fmt.Sprintf("Conversión masiva finalizada. %d procesados, %d errores.", total, errorsCount)
+	return fmt.Sprintf("Conversión finalizada. %d procesados, %d errores.", total, errorsCount)
 }
