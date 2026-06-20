@@ -157,12 +157,20 @@ func (a *App) ConvertLibrary(inputDir string, outputDir string, settings Convers
 			outPath := filepath.Join(outDirPath, outName)
 
 			if _, err := os.Stat(outPath); err == nil {
-				mu.Lock()
-				processed++
-				mu.Unlock()
-				<-sem
-				return
-			}
+    mu.Lock()
+    processed++
+    progress := (float64(processed) / float64(total)) * 100
+    runtime.EventsEmit(a.ctx, "conversion_progress", ProgressUpdate{
+        CurrentFile: filepath.Base(filePath) + " (omitido)",
+        Progress:    progress,
+        Processed:   processed,
+        Total:       total,
+        Errors:      errorsCount,
+    })
+    mu.Unlock()
+    <-sem
+    return
+}
 
 			coverToUse := ""
 			tempDir := filepath.Join(os.TempDir(), "haceropus_temp")
@@ -193,6 +201,7 @@ func (a *App) ConvertLibrary(inputDir string, outputDir string, settings Convers
 
 			// MEJORA: Se añade -compression_level y -ar 48000 para optimización nativa Opus
 			ffmpegArgs = append(ffmpegArgs, 
+				"-threads", "1",
 				"-c:a", "libopus", 
 				"-b:a", settings.Bitrate, 
 				"-vbr", "on", 

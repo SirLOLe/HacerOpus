@@ -1,6 +1,6 @@
 <script>
 	import { SelectDirectory, ConvertLibrary } from '../../wailsjs/go/main/App.js';
-	import { EventsOn } from '../../wailsjs/runtime/runtime.js';
+	import { EventsOn, EventsOff } from '../../wailsjs/runtime/runtime.js';
 	import { appSettings } from '../store.js';
 
 	let inputDir = "";
@@ -33,7 +33,7 @@
 
 		isProcessing = true;
 		resultMessage = `Escaneando biblioteca e iniciando transcodificación con ${$appSettings.threads} hilos...`;
-
+    EventsOff("conversion_progress");
 		EventsOn("conversion_progress", (update) => {
 			status = update;
 		});
