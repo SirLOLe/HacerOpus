@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -35,9 +38,10 @@ type ProgressUpdate struct {
 }
 
 type TrackMetadata struct {
-	Artist string
-	Album  string
-	Title  string
+	Artist   string
+	Album    string
+	Title    string
+	HasCover bool
 }
 
 func NewApp() *App { return &App{} }
@@ -61,20 +65,31 @@ func getMetadata(filePath string) TrackMetadata {
 	dirName := filepath.Base(filepath.Dir(filePath))
 
 	meta := TrackMetadata{
-		Artist: "Desconocido",
-		Album:  "Desconocido",
-		Title:  fileName,
+		Artist:   "Desconocido",
+		Album:    "Desconocido",
+		Title:    fileName,
+		HasCover: false,
 	}
 
-	cmd := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", filePath)
+	cmd := exec.Command("ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", filePath)
 	output, err := cmd.Output()
 	if err == nil {
 		var data struct {
+			Streams []struct {
+				CodecType string `json:"codec_type"`
+			} `json:"streams"`
 			Format struct {
 				Tags map[string]string `json:"tags"`
 			} `json:"format"`
 		}
 		if json.Unmarshal(output, &data) == nil {
+			for _, stream := range data.Streams {
+				if stream.CodecType == "video" {
+					meta.HasCover = true
+					break
+				}
+			}
+			
 			for k, v := range data.Format.Tags {
 				switch strings.ToLower(k) {
 				case "artist", "album_artist", "albumartist":
@@ -90,7 +105,6 @@ func getMetadata(filePath string) TrackMetadata {
 		}
 	}
 
-	// Fallback: parsear nombre de archivo si faltan tags
 	if meta.Title == fileName || meta.Title == "" {
 		if parts := strings.SplitN(fileName, " - ", 2); len(parts) == 2 {
 			left := strings.TrimSpace(parts[0])
@@ -113,12 +127,10 @@ func getMetadata(filePath string) TrackMetadata {
 		}
 	}
 
-	// Fallback: usar carpeta como álbum
 	if meta.Album == "Desconocido" && dirName != "." && dirName != "" {
 		meta.Album = dirName
 	}
 
-	// Limpiar caracteres inválidos en Windows
 	r := strings.NewReplacer(
 		"<", "", ">", "", ":", "", "\"", "",
 		"/", "-", "\\", "-", "|", "", "?", "", "*", "",
@@ -132,6 +144,43 @@ func getMetadata(filePath string) TrackMetadata {
 	if meta.Title  == "" { meta.Title  = fileName }
 
 	return meta
+}
+
+func findBestCover(folder string) string {
+	covers := []string{"folder.jpg", "cover.jpg", "front.png", "cover.png", "Folder.jpg", "Cover.jpg", "Front.png", "Cover.png"}
+	for _, c := range covers {
+		path := filepath.Join(folder, c)
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return ""
+}
+
+// createMetadataBlockPicture construye el bloque binario requerido por Ogg/Opus
+func createMetadataBlockPicture(imageBytes []byte) string {
+	buf := new(bytes.Buffer)
+
+	binary.Write(buf, binary.BigEndian, uint32(3)) // 3 = Front Cover
+	
+	mimeType := "image/jpeg"
+	binary.Write(buf, binary.BigEndian, uint32(len(mimeType)))
+	buf.WriteString(mimeType)
+
+	description := ""
+	binary.Write(buf, binary.BigEndian, uint32(len(description)))
+	buf.WriteString(description)
+
+	// Anchura, altura, color, indexado (Al estar en 0, el reproductor las infiere automáticamente)
+	binary.Write(buf, binary.BigEndian, uint32(0))
+	binary.Write(buf, binary.BigEndian, uint32(0))
+	binary.Write(buf, binary.BigEndian, uint32(0))
+	binary.Write(buf, binary.BigEndian, uint32(0))
+
+	binary.Write(buf, binary.BigEndian, uint32(len(imageBytes)))
+	buf.Write(imageBytes)
+
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
 }
 
 func (a *App) ConvertLibrary(inputDir string, outputDir string, settings ConversionSettings) string {
@@ -178,7 +227,6 @@ func (a *App) ConvertLibrary(inputDir string, outputDir string, settings Convers
 			os.MkdirAll(outDirPath, os.ModePerm)
 			outPath := filepath.Join(outDirPath, meta.Title+".opus")
 
-			// Saltar si ya existe
 			if _, err := os.Stat(outPath); err == nil {
 				mu.Lock()
 				processed++
@@ -192,21 +240,78 @@ func (a *App) ConvertLibrary(inputDir string, outputDir string, settings Convers
 				return
 			}
 
-			// Comando FFmpeg limpio — solo audio, sin portada
-			// (Opus/Ogg no soporta streams de video incrustados)
+			currentDir := filepath.Dir(filePath)
+			externalCover := findBestCover(currentDir)
+
+			coverSize := settings.CoverSize
+			if coverSize <= 0 { coverSize = 700 }
+			vfOpt := fmt.Sprintf("scale=%d:%d:force_original_aspect_ratio=decrease", coverSize, coverSize)
+
+			var imageBytes []byte
+
+			// 1. Extraer la imagen en memoria (ya escalada)
+			if (settings.ReplaceCover || !meta.HasCover) && externalCover != "" {
+				extractCmd := exec.Command("ffmpeg", "-y", "-i", externalCover, "-vf", vfOpt, "-c:v", "mjpeg", "-f", "image2pipe", "-")
+				imageBytes, _ = extractCmd.Output()
+			} else if meta.HasCover {
+				extractCmd := exec.Command("ffmpeg", "-y", "-i", filePath, "-an", "-vframes", "1", "-vf", vfOpt, "-c:v", "mjpeg", "-f", "image2pipe", "-")
+				imageBytes, _ = extractCmd.Output()
+			}
+
 			args := []string{
 				"-y",
 				"-i", filePath,
-				"-vn",   // Ignorar cualquier stream de video/portada del input
+			}
+
+			// 2. Si conseguimos extraer una imagen, preparamos el archivo de metadatos especial para evitar desbordar los límites de Windows
+			if len(imageBytes) > 0 {
+				metaFile, err := os.CreateTemp("", "opusmeta_*.txt")
+				if err == nil {
+					metaFilePath := metaFile.Name()
+					metaFile.Close()
+					defer os.Remove(metaFilePath)
+
+					// Volcar los metadatos originales al archivo temporal
+					exec.Command("ffmpeg", "-y", "-i", filePath, "-f", "ffmetadata", metaFilePath).Run()
+
+					metaData, _ := os.ReadFile(metaFilePath)
+					metaDataStr := string(metaData)
+
+					// Evitar posibles duplicados y estructurar
+					lines := strings.Split(metaDataStr, "\n")
+					var cleanLines []string
+					for _, line := range lines {
+						if !strings.HasPrefix(line, "METADATA_BLOCK_PICTURE=") && strings.TrimSpace(line) != "" {
+							cleanLines = append(cleanLines, line)
+						}
+					}
+
+					base64Str := createMetadataBlockPicture(imageBytes)
+					base64Str = strings.ReplaceAll(base64Str, "=", "\\=") // Escapado obligatorio de FFmpeg
+
+					cleanLines = append(cleanLines, "METADATA_BLOCK_PICTURE="+base64Str)
+					os.WriteFile(metaFilePath, []byte(strings.Join(cleanLines, "\n")+"\n"), 0644)
+
+					// Inyectar el archivo mapeado
+					args = append(args, "-i", metaFilePath, "-map", "0:a", "-map_metadata", "1")
+				} else {
+					args = append(args, "-map", "0:a", "-map_metadata", "0")
+				}
+			} else {
+				args = append(args, "-map", "0:a", "-map_metadata", "0")
+			}
+
+			// 3. Ejecutar la codificación final eliminando cualquier canal de video nativo para evitar crasheos de Opus
+			args = append(args,
 				"-c:a", "libopus",
 				"-b:a", settings.Bitrate,
 				"-vbr", "on",
 				"-compression_level", fmt.Sprintf("%d", settings.CompressionLevel),
 				"-ar", "48000",
+				"-vn", // Remueve flujos de video. Es fundamental para Opus.
 				"-threads", "1",
-				"-map_metadata", "0",
 				outPath,
-			}
+			)
 
 			cmd := exec.Command("ffmpeg", args...)
 			var stderr strings.Builder
@@ -218,7 +323,6 @@ func (a *App) ConvertLibrary(inputDir string, outputDir string, settings Convers
 			processed++
 			if err != nil {
 				errorsCount++
-				// Log del error real para debuggear si vuelve a fallar
 				fmt.Printf("ERROR [%s]: %v\n→ %s\n",
 					filepath.Base(filePath), err, stderr.String())
 			}
